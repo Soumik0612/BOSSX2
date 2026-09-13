@@ -1,4 +1,4 @@
-const {
+jiconst {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
@@ -1580,11 +1580,7 @@ https://chat.whatsapp.com/${code}`);
       } else {
         const value = cleanCustomMessage(argsRaw);
         if (!value) {
-          await sendBotReply(sock, jid, `Usage: ${getBotPrefix()}setwelcome <message>\n\nCurrent Welcome Message*\n\n${groupSettings.welcomeMessage}\n\n*Tip:* Use @user to mention the new member`
-        }, { quoted: msg });
-      }
-      
-      এই group-এর জন্য welcome caption সেট হবে।\nPlaceholders: {user}, {group}, {count}\nReset: ${getBotPrefix()}setwelcome default`);
+          await sendBotReply(sock, jid, `Usage: ${getBotPrefix()}setwelcome <message>\n\nএই group-এর জন্য welcome caption সেট হবে।\nPlaceholders: {@user}, {group}, {count}\nReset: ${getBotPrefix()}setwelcome default`);
         } else if (value.toLowerCase() === "default") {
           resetGroupMessage(settings.welcomeGroups, jid);
           setWelcomeEnabledForGroup(jid, true);
@@ -1605,7 +1601,7 @@ https://chat.whatsapp.com/${code}`);
       } else {
         const value = cleanCustomMessage(argsRaw);
         if (!value) {
-          await sendBotReply(sock, jid, `Usage: ${getBotPrefix()}setgoodbye <message>\n\nএই group-এর goodbye caption সেট হবে।\nPlaceholders: {user}, {group}, {count}\nReset: ${getBotPrefix()}setgoodbye default`);
+          await sendBotReply(sock, jid, `Usage: ${getBotPrefix()}setgoodbye <message>\n\nএই group-এর goodbye caption সেট হবে।\nPlaceholders: {@user}, {group}, {count}\nReset: ${getBotPrefix()}setgoodbye default`);
         } else if (value.toLowerCase() === "default") {
           resetGroupMessage(settings.goodbyeGroups, jid);
           setGoodbyeEnabledForGroup(jid, true);
