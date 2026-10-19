@@ -1,4 +1,4 @@
-jiconst {
+const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
@@ -42,6 +42,7 @@ const DEFAULT_SETTINGS = {
   antimention: false,
   antilink: false,
   antiLinkGroups: {},
+  antiLinkCounts: {},
   welcomeGroups: {},
   goodbyeGroups: {},
   welcomeEnabledGroups: {},
@@ -57,6 +58,8 @@ const DEFAULT_SETTINGS = {
   // Command access mode: private = owner + sudo users, public = all users
   // (admin-only commands still require group admin/owner).
   mode: "private",
+  autoReaction: false,
+  autoAdmin: false,
 };
 
 let settings = loadSettings();
@@ -65,6 +68,8 @@ if (!settings.mode) {
   saveSettings();
 }
 if (!Array.isArray(settings.sudoUsers)) { settings.sudoUsers = []; saveSettings(); }
+if (typeof settings.autoReaction !== "boolean") settings.autoReaction = false;
+if (typeof settings.autoAdmin !== "boolean") settings.autoAdmin = false;
 if (!settings.antiAdminGroups || typeof settings.antiAdminGroups !== "object" || Array.isArray(settings.antiAdminGroups)) settings.antiAdminGroups = {};
 if (!settings.antiStickerGroups || typeof settings.antiStickerGroups !== "object" || Array.isArray(settings.antiStickerGroups)) settings.antiStickerGroups = {};
 if (!settings.antiStickerCounts || typeof settings.antiStickerCounts !== "object" || Array.isArray(settings.antiStickerCounts)) settings.antiStickerCounts = {};
@@ -74,6 +79,7 @@ if (!settings.antiStatusGroups || typeof settings.antiStatusGroups !== "object" 
 if (!settings.antiStatusKickGroups || typeof settings.antiStatusKickGroups !== "object" || Array.isArray(settings.antiStatusKickGroups)) settings.antiStatusKickGroups = {};
 if (!settings.antiStatusWarnings || typeof settings.antiStatusWarnings !== "object" || Array.isArray(settings.antiStatusWarnings)) settings.antiStatusWarnings = {};
 if (!settings.antiLinkGroups || typeof settings.antiLinkGroups !== "object" || Array.isArray(settings.antiLinkGroups)) settings.antiLinkGroups = {};
+if (!settings.antiLinkCounts || typeof settings.antiLinkCounts !== "object" || Array.isArray(settings.antiLinkCounts)) settings.antiLinkCounts = {};
 if (!settings.welcomeGroups || typeof settings.welcomeGroups !== "object" || Array.isArray(settings.welcomeGroups)) settings.welcomeGroups = {};
 if (!settings.goodbyeGroups || typeof settings.goodbyeGroups !== "object" || Array.isArray(settings.goodbyeGroups)) settings.goodbyeGroups = {};
 if (!settings.welcomeEnabledGroups || typeof settings.welcomeEnabledGroups !== "object" || Array.isArray(settings.welcomeEnabledGroups)) settings.welcomeEnabledGroups = {};
@@ -118,10 +124,39 @@ function setBotPrefix(value) {
   saveSettings();
   return prefix;
 }
+function participantJidValue(value) {
+  if (!value) return "";
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  if (typeof value === "object") {
+    return String(
+      value.phoneNumber ||
+      value.id ||
+      value.jid ||
+      value.wid ||
+      value.lid ||
+      value.participant ||
+      ""
+    );
+  }
+  return String(value);
+}
+
+function normalizeParticipantList(participants) {
+  return Array.from(new Set(
+    (Array.isArray(participants) ? participants : [participants])
+      .map(participantJidValue)
+      .map(v => v.trim())
+      .filter(Boolean)
+  ));
+}
+
 function formatGroupMessage(template, participants, groupName = "") {
-  const users = Array.from(new Set((participants || []).filter(Boolean)));
+  const users = normalizeParticipantList(participants);
   const list = users.map(p => `@${baseNumber(p)}`).join(" ");
+
   return String(template || "")
+    .replace(/\{@mention\}/gi, list || "everyone")
+    .replace(/\{mention\}/gi, list || "everyone")
     .replace(/\{user\}/gi, list || "everyone")
     .replace(/\{count\}/gi, String(users.length))
     .replace(/\{group\}/gi, groupName || "this group");
@@ -182,6 +217,89 @@ function getContextInfo(msg) {
     m.listResponseMessage?.contextInfo ||
     {};
 }
+
+function getPairedJid(sock) {
+  const raw = sock?.user?.id || sock?.user?.phoneNumber || sock?.user?.jid || sock?.user?.wid || "";
+  const jid = String(raw || "");
+  return jid.includes("@") ? jid : normalizeJid(jid);
+}
+
+function getQuotedMessageObject(msg, jid) {
+  const ctx = getContextInfo(msg);
+  if (!ctx?.quotedMessage || !ctx?.stanzaId) return null;
+  return {
+    key: {
+      remoteJid: jid,
+      id: ctx.stanzaId,
+      participant: ctx.participant || ctx.participantPn
+    },
+    message: ctx.quotedMessage
+  };
+}
+
+function isViewOnceMessage(msg) {
+  const raw = msg?.message || {};
+  return Boolean(
+    raw.viewOnceMessage ||
+    raw.viewOnceMessageV2 ||
+    raw.viewOnceMessageV2Extension ||
+    raw.ephemeralMessage?.message?.viewOnceMessage ||
+    raw.ephemeralMessage?.message?.viewOnceMessageV2 ||
+    raw.ephemeralMessage?.message?.viewOnceMessageV2Extension
+  );
+}
+
+async function handleMediaShortcut(sock, msg, shortcut) {
+  const jid = msg?.key?.remoteJid;
+  const quoted = getQuotedMessageObject(msg, jid);
+  if (!quoted) {
+    await sendTextSafe(sock, jid, `❌ ${shortcut} ব্যবহার করতে আগে একটি normal photo/video message reply করুন।`);
+    return true;
+  }
+
+  if (isViewOnceMessage(quoted)) {
+    await sendTextSafe(sock, jid, "🔒 View Once media download/forward করে গোপনে সংরক্ষণ করার feature দেওয়া হয়নি।");
+    return true;
+  }
+
+  const qm = unwrapMessage(quoted.message);
+  if (!qm?.videoMessage) {
+    await sendTextSafe(sock, jid, `❌ ${shortcut} শুধু video reply-তে কাজ করবে।`);
+    return true;
+  }
+
+  try {
+    const buffer = await downloadMediaMessage(
+      quoted, "buffer", {}, { logger: P({ level: "silent" }) }
+    );
+    if (!Buffer.isBuffer(buffer) || !buffer.length) throw new Error("empty media");
+
+    const caption = qm.videoMessage.caption || "";
+    const target = getPairedJid(sock);
+    if (!target) throw new Error("paired account JID not found");
+
+    if (shortcut === "🪀") {
+      await sock.sendMessage(target, {
+        video: buffer,
+        mimetype: qm.videoMessage.mimetype || "video/mp4",
+        caption: caption ? `📥 Downloaded video\n\n${caption}` : "📥 Downloaded video"
+      });
+      await sendTextSafe(sock, jid, "🪀 Video paired number-এর chat-এ পাঠানো হয়েছে ✅");
+    } else {
+      await sock.sendMessage("status@broadcast", {
+        video: buffer,
+        mimetype: qm.videoMessage.mimetype || "video/mp4",
+        caption
+      });
+      await sendTextSafe(sock, jid, "🫠 Video paired account-এর WhatsApp Status-এ পোস্ট করা হয়েছে ✅");
+    }
+  } catch (e) {
+    logger.error({ err: e, shortcut, jid }, "media shortcut failed");
+    await sendTextSafe(sock, jid, `❌ Video process করা যায়নি: ${e.message || "unknown error"}`);
+  }
+  return true;
+}
+
 function rememberMessage(msg) {
   if (!msg?.key?.id || msg.key.fromMe || !msg.message) return;
   messageStore.set(msg.key.id, msg);
@@ -473,9 +591,80 @@ async function sendOwnerPhoto(sock, jid, caption, options = {}) {
   return await sendTextSafe(sock, jid, caption, options);
 }
 
+async function sendGroupOnlyReply(sock, jid, text, options = {}) {
+  // Group-only commands use a compact owner thumbnail in WhatsApp's
+  // external preview area instead of sending the full owner photo.
+  const configuredPhoto = String(config.OWNER_PHOTO || "owner.jpg");
+  const photoPath = path.isAbsolute(configuredPhoto)
+    ? configuredPhoto
+    : path.join(__dirname, configuredPhoto.replace(/^\.?[\\/]/, ""));
+
+  const contextInfo = { ...(options.contextInfo || {}) };
+  if (fs.existsSync(photoPath)) {
+    try {
+      contextInfo.externalAdReply = {
+        ...(contextInfo.externalAdReply || {}),
+        title: "BOSS X",
+        body: `Owner • ${config.OWNER_NAME}`,
+        mediaType: 1,
+        thumbnail: fs.readFileSync(photoPath),
+        renderLargerThumbnail: false,
+        showAdAttribution: false,
+        sourceUrl: config.CHANNEL_URL || "https://whatsapp.com/"
+      };
+    } catch (e) {
+      logger.warn({ err: e, jid }, "group-only thumbnail preparation failed");
+    }
+  }
+
+  return await sendBotReply(sock, jid, text, { ...options, contextInfo });
+}
+
+async function sendMenuPhotoReply(sock, jid, caption, options = {}) {
+  // Menu uses its own dedicated photo so changing the menu image does not
+  // change the owner/group thumbnail used elsewhere.
+  const photoPath = path.join(__dirname, "menu.jpg");
+  let result;
+  if (fs.existsSync(photoPath)) {
+    try {
+      result = await sock.sendMessage(jid, {
+        image: fs.readFileSync(photoPath),
+        caption,
+        ...options
+      });
+    } catch (e) {
+      logger.warn({ err: e, jid }, "menu photo send failed; falling back to text");
+    }
+  }
+  if (!result) result = await sendTextSafe(sock, jid, caption, options);
+  return result;
+}
+
 async function sendOwnerPhotoReply(sock, jid, caption, options = {}) {
-  // Owner photo/card is intentionally disabled; send the owner name/text only.
-  const result = await sendTextSafe(sock, jid, caption, options);
+  // Always try the bundled owner.jpg first. If it is unavailable or WhatsApp
+  // rejects the image, fall back to the normal text reply.
+  const configuredPhoto = String(config.OWNER_PHOTO || "owner.jpg");
+  const photoPath = path.isAbsolute(configuredPhoto)
+    ? configuredPhoto
+    : path.join(__dirname, configuredPhoto.replace(/^\.?[\\\\/]/, ""));
+
+  let result;
+  if (fs.existsSync(photoPath)) {
+    try {
+      result = await sock.sendMessage(jid, {
+        image: fs.readFileSync(photoPath),
+        caption,
+        ...options
+      });
+    } catch (e) {
+      logger.warn({ err: e, jid }, "owner photo send failed; falling back to text");
+    }
+  }
+
+  if (!result) {
+    result = await sendTextSafe(sock, jid, caption, options);
+  }
+
   try {
     if (result?.key) {
       await sock.sendMessage(jid, {
@@ -527,10 +716,33 @@ async function restoreDeleted(sock, update, label) {
 async function sendOwnerCommandCard(sock, jid, title, extra = "") {
   const lines = [title, `👑 ${config.OWNER_NAME}`];
   if (extra) lines.push(extra);
-  return await sendOwnerPhotoReply(sock, jid, lines.join("\n"));
+  // Command cards use the same compact owner thumbnail as .ping/group-only
+  // replies; never send the full-size owner image.
+  return await sendGroupOnlyReply(sock, jid, lines.join("\n"));
+}
+
+async function findYtDlpCommand() {
+  const candidates = [
+    ["yt-dlp", []],
+    ["python3", ["-m", "yt_dlp"]],
+    ["python", ["-m", "yt_dlp"]]
+  ];
+  for (const [bin, args] of candidates) {
+    try {
+      await new Promise((resolve, reject) => {
+        const proc = spawn(bin, [...args, "--version"], { stdio: ["ignore", "pipe", "ignore"] });
+        proc.once("error", reject);
+        proc.once("close", code => code === 0 ? resolve() : reject(new Error("not available")));
+      });
+      return { bin, prefixArgs: args };
+    } catch {}
+  }
+  return null;
 }
 
 async function runYtDlpAudio(url) {
+  const command = await findYtDlpCommand();
+  if (!command) throw new Error("yt-dlp পাওয়া যায়নি");
   return await new Promise((resolve, reject) => {
     const args = [
       "--no-playlist",
@@ -543,7 +755,7 @@ async function runYtDlpAudio(url) {
       "-o", "-"
       , url
     ];
-    const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const proc = spawn(command.bin, [...command.prefixArgs, ...args], { stdio: ["ignore", "pipe", "pipe"] });
     const chunks = [];
     const errors = [];
     let total = 0;
@@ -817,13 +1029,38 @@ const adminCommands = new Set([
 ]);
 
 
+async function resolveMentionJids(sock, jid, participants) {
+  const wanted = normalizeParticipantList(participants);
+  if (!wanted.length || !isGroup(jid)) return wanted;
+
+  try {
+    const metadata = await getGroupMetadataSafe(sock, jid);
+    const resolved = [];
+    for (const who of wanted) {
+      const p = (metadata?.participants || []).find(x =>
+        participantMatchesJid(x, who) ||
+        String(x?.id || "") === who ||
+        String(x?.lid || "") === who ||
+        String(x?.phoneNumber || "") === who
+      );
+      // WhatsApp mentions must use a real user JID. Prefer phoneNumber when
+      // the participant update supplied a LID.
+      resolved.push(String(p?.phoneNumber || p?.id || p?.jid || p?.lid || who));
+    }
+    return Array.from(new Set(resolved.filter(Boolean)));
+  } catch (e) {
+    logger.warn({ err: e, jid }, "could not resolve participant mentions");
+    return wanted;
+  }
+}
+
 async function sendWelcomeMessage(sock, jid, participants, groupName = "") {
-  const mentions = Array.from(new Set((participants || []).filter(Boolean)));
+  const mentions = await resolveMentionJids(sock, jid, participants);
   const caption = formatGroupMessage(getGroupWelcomeMessage(jid), mentions, groupName);
   const configuredPhoto = String(settings.welcomePhoto || config.WELCOME_PHOTO || "welcome.jpg");
   const photoPath = path.isAbsolute(configuredPhoto)
     ? configuredPhoto
-    : path.join(__dirname, configuredPhoto.replace(/^\.?[\\/]/, ""));
+    : path.join(__dirname, configuredPhoto.replace(/^\.?[\\\\/]/, ""));
 
   if (fs.existsSync(photoPath)) {
     try {
@@ -836,7 +1073,7 @@ async function sendWelcomeMessage(sock, jid, participants, groupName = "") {
 }
 
 async function sendGoodbyeMessage(sock, jid, participants, groupName = "") {
-  const mentions = Array.from(new Set((participants || []).filter(Boolean)));
+  const mentions = await resolveMentionJids(sock, jid, participants);
   const caption = formatGroupMessage(getGroupGoodbyeMessage(jid), mentions, groupName);
   return await sendTextSafe(sock, jid, caption, { mentions });
 }
@@ -885,6 +1122,17 @@ async function handleMessage(sock, msg) {
   const senderPn = msg.key.participantPn || msg.key.participant || jid;
   const text = getText(msg).trim();
 
+  // Optional automatic reactions. Never react to our own messages.
+  if (!isSelfMessage && settings.autoReaction) {
+    try {
+      const reactionPool = ["❤️", "🔥", "😂", "👍", "😎", "⚡", "🎀", "😙", "💋", "🙂", "🫶🏻", "🥺", "🫂", "✨", "🎉", "😲", "👀", "🌺", "😇", "👿", "👣", "💦"];
+      const emoji = reactionPool[Math.floor(Math.random() * reactionPool.length)];
+      await sock.sendMessage(jid, { react: { text: emoji, key: msg.key } });
+    } catch (e) {
+      logger.debug?.({ err: e, jid }, "auto reaction failed");
+    }
+  }
+
   // ANTI-STICKER: delete stickers immediately in enabled groups.
   // Group admins/owner are exempt and may always send stickers.
   if (!isSelfMessage && isGroup(jid) && isAntiStickerEnabledForGroup(jid)) {
@@ -916,7 +1164,7 @@ async function handleMessage(sock, msg) {
               if (fs.existsSync(stickerPath)) {
                 await sock.sendMessage(jid, { sticker: fs.readFileSync(stickerPath) });
               } else {
-                await sock.sendMessage(jid, { text: "*⚠️ আরে খানকির ছেলে তুই নাকি আবার আমার গ্রূপে sticker মারবি। তোর মা কে চুদি*" });
+                await sock.sendMessage(jid, { text: "*⚠️ আরে খানকির ছেলে তুই নাকি আবার আমার গ্রূপে sticker মারবি। তোর মা কে চুদি🖕🏻*" });
               }
             } else {
               saveSettings();
@@ -1042,42 +1290,59 @@ ${kickOn ? "🚪 *৩টি warning পূর্ণ হওয়ায় আপনা
     }
   }
 
-  // ANTI-LINK: run before command handling so a link is moderated immediately.
-  // Admins and owner are exempt. Bot MUST be admin to delete/kick.
-  if (!isSelfMessage && isAntiLinkEnabledForGroup(jid) && containsLinkInMessage(msg)) {
+  // ANTI-LINK: admins are exempt. Count link messages per member in each
+  // enabled group. On the 3rd link (>2), delete the link, close the group,
+  // and remove the offender.
+  if (!isSelfMessage && isGroup(jid) && isAntiLinkEnabledForGroup(jid) && containsLinkInMessage(msg)) {
     try {
       const senderIsAdmin = await requireAdmin(sock, jid, sender, senderPn);
-      if (!senderIsAdmin) {
-        if (!(await isBotAdmin(sock, jid))) {
-          await new Promise(r => setTimeout(r, 300));
-          if (!(await isBotAdmin(sock, jid))) {
-            await sock.sendMessage(jid, {
-              text: "⚠️ ANTI-LINK ON আছে, কিন্তু BOSS X-এর admin status পাওয়া যাচ্ছে না। Group info refresh করে আবার চেষ্টা করুন।"
-            });
-            return;
-          }
+      if (senderIsAdmin) return;
+
+      if (!(await isBotAdmin(sock, jid))) {
+        await sock.sendMessage(jid, {
+          text: "⚠️ ANTI-LINK ON আছে, কিন্তু BOSS X admin নয়। Bot-কে admin করে আবার চেষ্টা করুন।"
+        });
+        return;
+      }
+
+      const groupCounts = settings.antiLinkCounts[jid] && typeof settings.antiLinkCounts[jid] === "object"
+        ? settings.antiLinkCounts[jid]
+        : {};
+      const key = baseNumber(sender) || String(sender);
+      groupCounts[key] = Number(groupCounts[key] || 0) + 1;
+      settings.antiLinkCounts[jid] = groupCounts;
+      saveSettings();
+
+      const deleted = await deleteMessage(sock, jid, msg.key);
+
+      if (groupCounts[key] > 2) {
+        let closed = false;
+        let kicked = false;
+        try {
+          await sock.groupSettingUpdate(jid, "announcement");
+          closed = true;
+        } catch (err) {
+          logger.error({ err, jid }, "anti-link group close failed");
         }
 
-        const deleted = await deleteMessage(sock, jid, msg.key);
-
-        // Anti-link: delete the offending message and immediately remove
-        // the sender from this group. Admins/owner are exempt above.
-        let kicked = false;
-        let kickError = null;
         try {
           await removeParticipantRobust(sock, jid, sender);
           kicked = true;
         } catch (err) {
-          kickError = err;
-          logger.error({ err, jid, sender }, "anti-link kick failed");
+          logger.error({ err, jid, sender }, "anti-link third-link kick failed");
         }
 
+        // Reset this sender's counter after enforcement; keep other members' counts.
+        delete groupCounts[key];
+        saveSettings();
+
         await sock.sendMessage(jid, {
-          text: kicked
-            ? `🚫 ANTI-LINK\n@${baseNumber(sender)}-Link মারলি তোর মা ভাজবে বেগুনের চপ তোর মায়ের গুদে গব গব গব কেমন দিলাম বলো Public 🫵😅`
-            : deleted
-              ? `🚫 ANTI-LINK\n@${baseNumber(sender)}-এর link message delete করা হয়েছে, কিন্তু তাকে remove করা যায়নি। Bot admin status ও target participant check করুন।`
-              : `🚫 ANTI-LINK\n@${baseNumber(sender)} link পাঠাতে পারবে না; message delete/kick সম্পন্ন হয়নি।`,
+          text: `🚫 ANTI-LINK LIMIT EXCEEDED\n@${baseNumber(sender)} ৩য় link পাঠিয়েছে group বন্ধ করে খানকির ছেলের remove করা হলো আর link পাঠাবি তোর মাকে চদি।\n🗑️ Link message: ${deleted ? "Deleted ✅" : "Delete failed ⚠️"}\n🔒 Group: ${closed ? "Closed 🔒" : "Close failed ⚠️"}\n🥾 Member: ${kicked ? "Removed ✅" : "Remove failed ⚠️"}`,
+          mentions: [sender]
+        });
+      } else {
+        await sock.sendMessage(jid, {
+          text: `⚠️ ANTI-LINK\n@${baseNumber(sender)}-এই খানকির ছেলের link delete করা হয়েছে।\n📊 Link count: ${groupCounts[key]}/2\n🚨 ৩য় link পাঠালে group বন্ধ করে খানকির ছেলের remove করা হবে আর link পাঠাবি তোর মাকে চদি। ।`,
           mentions: [sender]
         });
       }
@@ -1145,6 +1410,43 @@ ${kickOn ? "🚪 *৩টি warning পূর্ণ হওয়ায় আপনা
     isOwner(senderPn) ||
     isSudo(sender, senderPn);
 
+  // AUTOREACTION / AUTOADMIN are owner-only controls.
+  if (command === "autoreaction") {
+    if (!isOwner(sender) && !isOwner(senderPn) && !isSelfMessage) {
+      await sendBotReply(sock, jid, "❌ শুধু paired/owner account এটি পরিবর্তন করতে পারবে।");
+      return;
+    }
+    const value = args[0]?.toLowerCase();
+    if (!["on", "off"].includes(value)) {
+      await sendBotReply(sock, jid, `Usage: ${getBotPrefix()}autoreaction on/off`);
+      return;
+    }
+    settings.autoReaction = value === "on";
+    saveSettings();
+    await sendBotReply(sock, jid, `🤖 AUTOREACTION ${settings.autoReaction ? "ON ✅" : "OFF ❌"}`);
+    return;
+  }
+
+  if (command === "autoadmin") {
+    if (!isOwner(sender) && !isOwner(senderPn) && !isSelfMessage) {
+      await sendBotReply(sock, jid, "❌ শুধু paired/owner account এটি পরিবর্তন করতে পারবে।");
+      return;
+    }
+    const value = args[0]?.toLowerCase();
+    if (!["on", "off"].includes(value)) {
+      await sendBotReply(sock, jid, `Usage: ${getBotPrefix()}autoadmin on/off`);
+      return;
+    }
+    settings.autoAdmin = value === "on";
+    saveSettings();
+    await sendBotReply(sock, jid,
+      `👑 AUTOADMIN ${settings.autoAdmin ? "ON ✅" : "OFF ❌"}\n\n` +
+      `⚠️ WhatsApp-এর নিয়ম অনুযায়ী bot নিজে admin না থাকলে নিজেকে/owner-কে admin বানাতে পারে না। ` +
+      `Bot admin থাকলে featureটি owner promotion-এর জন্য ব্যবহার করা যাবে।`);
+    return;
+  }
+
+
   // BASIC self commands must always reach the dispatcher when they come
   // from the paired WhatsApp account. This is intentionally limited to
   // self/owner/sudo identities and does not make `.menu` public.
@@ -1162,7 +1464,13 @@ ${kickOn ? "🚪 *৩টি warning পূর্ণ হওয়ায় আপনা
 │ 🧰 BASIC
 │ 🏓 ${getBotPrefix()}ping
 │ 📋 ${getBotPrefix()}menu
+│ ❓ ${getBotPrefix()}help
 │ 👑 ${getBotPrefix()}owner
+│ 📢 ${getBotPrefix()}channel
+│ ⚙️ ${getBotPrefix()}settings
+│ 🔧 ${getBotPrefix()}setprefix <prefix>
+│ 🔧 ${getBotPrefix()}prefix <prefix>
+│ 🔐 ${getBotPrefix()}mode private/public
 │
 │ 🛡️ SECURITY
 │ 📞 ${getBotPrefix()}anticall on/off
@@ -1172,29 +1480,58 @@ ${kickOn ? "🚪 *৩টি warning পূর্ণ হওয়ায় আপনা
 │ 👮 ${getBotPrefix()}antiadmin on/off
 │ 🧹 ${getBotPrefix()}antisticker on/off
 │ 🏷️ ${getBotPrefix()}antimention on/off
+│ 🏷️ ${getBotPrefix()}antitag on/off
 │ 🚨 ${getBotPrefix()}antistatus on/off
 │ 👢 ${getBotPrefix()}antistatus kick on/off
 │ 🔗 ${getBotPrefix()}antilink on/off
 │ 🤖 ${getBotPrefix()}botadd <number>
 │ 🗑️ ${getBotPrefix()}botdel <number>
-│ 👢 ${getBotPrefix()}kick @user / reply ${getBotPrefix()}kick
+│
+│ 👥 GROUP
+│ 🚪 ${getBotPrefix()}lft
+│ 👑 ${getBotPrefix()}atag
+│ ℹ️ ${getBotPrefix()}gf
+│ 👢 ${getBotPrefix()}kick @user / reply
 │ 💥 ${getBotPrefix()}kickall
 │ 📢 ${getBotPrefix()}htag
 │ 🏷️ ${getBotPrefix()}tagall
 │ 🏷️ ${getBotPrefix()}totag (reply)
-│ 👁️ ${getBotPrefix()}lol (reply to photo)
-│ 🗑️ ${getBotPrefix()}de (reply to message)
+│ 👁️ ${getBotPrefix()}lol (reply)
+│ 🗑️ ${getBotPrefix()}de (reply)
+│ 🗑️ ${getBotPrefix()}del (reply)
+│ 🗑️ ${getBotPrefix()}delete (reply)
+│ 🔗 ${getBotPrefix()}link
+│ 🔗 ${getBotPrefix()}grouplink
+│ ♻️ ${getBotPrefix()}linkreset
+│ ♻️ ${getBotPrefix()}resetlink
+│ 🔓 ${getBotPrefix()}group open
+│ 🔒 ${getBotPrefix()}group close
+│ 🔓 ${getBotPrefix()}open
+│ 🔒 ${getBotPrefix()}close
 │
-│ 👥 GROUP
-│ 🔐 ${getBotPrefix()}setsudo <number> / reply
-│ 🗑️ ${getBotPrefix()}dlsudo <number> / reply
+│ 👋 WELCOME / GOODBYE
 │ ✍️ ${getBotPrefix()}setwelcome <message>
 │ ✍️ ${getBotPrefix()}setgoodbye <message>
 │
-│ \\ $2026 BOSSX
+│ 🎵 MEDIA
+│ 🎧 ${getBotPrefix()}song <name>
+│ ▶️ ${getBotPrefix()}play <name>
+│ 📖 ${getBotPrefix()}gcstory (reply)
+│
+│ 👑 OWNER / SUDO
+│ 🔐 ${getBotPrefix()}setsudo <number> / reply
+│ 🗑️ ${getBotPrefix()}dlsudo <number> / reply
+│ 🤖 ${getBotPrefix()}autoreaction on/off
+│ 👑 ${getBotPrefix()}autoadmin on/off
+│ 🌙 ${getBotPrefix()}goodnight
+│ 🌙 ${getBotPrefix()}gn
+│
+│BOSS X YOUR BROTHER ♥️
 ╰──────────────────╯`;
+
     try {
-      await sendTextSafe(sock, jid, menuText);
+      // Menu uses the BOSS X owner photo as a large image card.
+      await sendMenuPhotoReply(sock, jid, menuText);
     } catch (e) {
       logger.error({ err: e, jid, sender }, "menu send failed");
       try {
@@ -1210,6 +1547,74 @@ ${kickOn ? "🚪 *৩টি warning পূর্ণ হওয়ায় আপনা
     console.log(`⛔ COMMAND BLOCKED: ${command} from ${sender}`);
     return;
   }
+
+  // .lft: the paired bot account leaves the current group. Never allow a
+  // random group member to make the bot leave the group.
+  if (command === "lft") {
+    if (!isGroup(jid)) {
+      await sendBotReply(sock, jid, `❌ ${getBotPrefix()}lft শুধু group-এ ব্যবহার করা যাবে।`);
+      return;
+    }
+    if (!isSelfMessage && !isOwner(sender) && !isOwner(senderPn)) {
+      await sendBotReply(sock, jid, "❌ এই command শুধু paired/owner account ব্যবহার করতে পারবে।");
+      return;
+    }
+    try {
+      await sock.groupLeave(jid);
+    } catch (e) {
+      await sendBotReply(sock, jid, `❌ Group থেকে leave করা যায়নি: ${e.message || "unknown error"}`);
+    }
+    return;
+  }
+
+  // .atag: mention every group admin (not ordinary members).
+  if (command === "atag") {
+    if (!isGroup(jid)) {
+      await sendGroupOnlyReply(sock, jid, `❌ ${getBotPrefix()}atag শুধু group-এ ব্যবহার করা যাবে।`);
+      return;
+    }
+    try {
+      const metadata = await getGroupMetadataSafe(sock, jid);
+      const admins = (metadata?.participants || [])
+        .filter(participantIsAdmin)
+        .map(p => String(p?.id || p?.phoneNumber || p?.lid || ""))
+        .filter(Boolean);
+      const mentions = Array.from(new Set(admins));
+      if (!mentions.length) {
+        await sendBotReply(sock, jid, "ℹ️ এই group-এ কোনো admin পাওয়া যায়নি।");
+        return;
+      }
+      const body = `╭━━━〔 👑 GROUP ADMINS 〕━━━╮\n\n${mentions.map(p => `👑 @${baseNumber(p)}`).join("\n")}\n\n╰━━━━━━━━━━━━━━━━╯`;
+      await sendBotReply(sock, jid, body, { mentions });
+    } catch (e) {
+      await sendBotReply(sock, jid, `❌ Admin mention করা যায়নি: ${e.message || "unknown error"}`);
+    }
+    return;
+  }
+
+  // .gf: show useful information about the current group.
+  if (command === "gf") {
+    if (!isGroup(jid)) {
+      await sendGroupOnlyReply(sock, jid, `❌ ${getBotPrefix()}gf শুধু group-এ ব্যবহার করা যাবে।`);
+      return;
+    }
+    try {
+      const metadata = await getGroupMetadataSafe(sock, jid);
+      if (!metadata) throw new Error("group information পাওয়া যায়নি");
+      const participants = Array.isArray(metadata.participants) ? metadata.participants : [];
+      const admins = participants.filter(participantIsAdmin).length;
+      const created = metadata.creation ? new Date(Number(metadata.creation) * 1000).toLocaleString("en-IN") : "Unknown";
+      const description = String(metadata.desc || metadata.description || "No description").trim() || "No description";
+      const owner = metadata.owner || metadata.subjectOwner || "Unknown";
+      const groupInfo = `╭━━━〔 ℹ️ GROUP INFO 〕━━━╮\n│\n│ 📛 Name: ${metadata.subject || "Unknown"}\n│ 🆔 ID: ${jid}\n│ 👥 Members: ${participants.length}\n│ 👑 Admins: ${admins}\n│ 👤 Owner: @${baseNumber(owner)}\n│ 📅 Created: ${created}\n│ 📝 Description: ${description}\n│\n╰━━━━━━━━━━━━━━━━━━╯`;
+      const mentions = /^\d+$/.test(baseNumber(owner)) ? [owner] : [];
+      await sendBotReply(sock, jid, groupInfo, { mentions });
+    } catch (e) {
+      await sendBotReply(sock, jid, `❌ Group information পাওয়া যায়নি: ${e.message || "unknown error"}`);
+    }
+    return;
+  }
+
   const isAdmin = adminCommands.has(command);
 
   if (isAdmin && !isSelfMessage && !(await requireAdmin(sock, jid, sender, senderPn))) {
@@ -1242,13 +1647,33 @@ Remove: ${getBotPrefix()}dlsudo <number> অথবা reply করে ${getBotPr
         await sendBotReply(sock, jid, result.removed ? `🗑️ SUDO REMOVED ✅\n👤 -${baseNumber(result.jid)}` : `ℹ️ এই number sudo list-এ ছিল না।\n👤 ${baseNumber(result.jid)}`);
       }
     } else if (command === "ping") {
-      await sendOwnerPhotoReply(sock, jid, `⚡aru999+ BXSPEED 00.999
-👑 ${config.OWNER_NAME}`);
+      // .ping is a BASIC command and intentionally works in both
+      // private chats and groups. It must never show the group-only warning.
+      const pingCaption = `⚡𝐁𝐗 𝐒𝐏𝐄𝐄𝐃 𝟎.𝟗𝟗𝐒 🤖 𝐁𝐨𝐭: 𝐎𝐧𝐥𝐢𝐧𝐞
+👑 ${config.OWNER_NAME}`;
+      const configuredPhoto = String(config.OWNER_PHOTO || "owner.jpg");
+      const photoPath = path.isAbsolute(configuredPhoto)
+        ? configuredPhoto
+        : path.join(__dirname, configuredPhoto.replace(/^\.?[\/]/, ""));
+      const contextInfo = {};
+      if (fs.existsSync(photoPath)) {
+        contextInfo.externalAdReply = {
+          title: "BOSS X",
+          body: `Owner • ${config.OWNER_NAME}`,
+          mediaType: 1,
+          thumbnail: fs.readFileSync(photoPath),
+          renderLargerThumbnail: false,
+          showAdAttribution: false,
+          sourceUrl: config.CHANNEL_URL || "https://whatsapp.com/"
+        };
+      }
+      await sendBotReply(sock, jid, pingCaption, { contextInfo });
     } else if (command === "menu" || command === "help") {
       // Handled above before the mode/admin gate.
       return;
     } else if (command === "owner") {
-      await sendOwnerPhotoReply(sock, jid, `🤖 Bot Account: ${getBotAccountName(sock)}\n👑 Owner: ${config.OWNER_NAME}\n📱 ${config.OWNER_NUMBER}`);
+      // .owner is intentionally text-only: do not attach the owner photo here.
+      await sendBotReply(sock, jid, `🤖 Bot Account: ${getBotAccountName(sock)}\n👑 Owner: ${config.OWNER_NAME}\n📱 ${config.OWNER_NUMBER}`);
     } else if (command === "channel") {
       await sendOwnerPhotoReply(sock, jid, `📢 CHANNEL
 👑 ${config.OWNER_NAME}
@@ -1294,7 +1719,7 @@ Remove: ${getBotPrefix()}dlsudo <number> অথবা reply করে ${getBotPr
         const value = args[1]?.toLowerCase();
         if (["antilink", "anti-link", "antiadmin", "antisticker"].includes(feature)) {
           if (!isGroup(jid)) {
-            await sendBotReply(sock, jid, `❌ ${feature} শুধু group-এ ব্যবহার করা যাবে।`);
+            await sendGroupOnlyReply(sock, jid, `❌ ${feature} শুধু group-এ ব্যবহার করা যাবে।`);
           } else if (!["on", "off"].includes(value)) {
             await sendBotReply(sock, jid, `Usage: ${getBotPrefix()}settings ${feature} on/off`);
           } else {
@@ -1312,7 +1737,7 @@ Remove: ${getBotPrefix()}dlsudo <number> অথবা reply করে ${getBotPr
       }
     } else if (command === "antistatus") {
       if (!isGroup(jid)) {
-        await sendBotReply(sock, jid, "❌ antistatus শুধু group-এ ব্যবহার করা যাবে।");
+        await sendGroupOnlyReply(sock, jid, "❌ antistatus শুধু group-এ ব্যবহার করা যাবে।");
       } else {
         const sub = args[0]?.toLowerCase();
         const value = args[1]?.toLowerCase();
@@ -1336,7 +1761,7 @@ ${getBotPrefix()}antistatus kick on/off`);
       }
     } else if (["antiadmin", "antisticker"].includes(command)) {
       if (!isGroup(jid)) {
-        await sendBotReply(sock, jid, `❌ ${command} শুধু group-এ ব্যবহার করা যাবে।`);
+        await sendGroupOnlyReply(sock, jid, `❌ ${command} শুধু group-এ ব্যবহার করা যাবে।`);
       } else {
         const value = args[0]?.toLowerCase();
         if (!["on", "off"].includes(value)) {
@@ -1355,7 +1780,7 @@ ${getBotPrefix()}antistatus kick on/off`);
         await sendBotReply(sock, jid, `Usage: .${command} on/off`);
       } else if (command === "antilink") {
         if (!isGroup(jid)) {
-          await sendBotReply(sock, jid, `❌ ${command} শুধু group-এ ব্যবহার করা যাবে।`);
+          await sendGroupOnlyReply(sock, jid, `❌ ${command} শুধু group-এ ব্যবহার করা যাবে।`);
           return;
         }
         const enabled = value === "on";
@@ -1424,7 +1849,7 @@ ${getBotPrefix()}antistatus kick on/off`);
       }
     } else if (command === "kick") {
       if (!isGroup(jid)) {
-        await sendBotReply(sock, jid, "❌ এই command শুধু group-এ ব্যবহার করা যাবে।");
+        await sendGroupOnlyReply(sock, jid, "❌ এই command শুধু group-এ ব্যবহার করা যাবে।");
       } else if (!(await isBotAdmin(sock, jid))) {
         await sendBotReply(sock, jid, "❌ Kick করতে bot-কে admin করতে হবে।");
       } else {
@@ -1454,31 +1879,46 @@ ${getBotPrefix()}antistatus kick on/off`);
       }
     } else if (["htag", "tagall", "totag"].includes(command)) {
       if (!isGroup(jid)) {
-        await sendBotReply(sock, jid, "❌ এই command শুধু group-এ ব্যবহার করা যাবে।");
+        await sendGroupOnlyReply(sock, jid, "❌ এই command শুধু group-এ ব্যবহার করা যাবে।");
       } else {
         const metadata = await sock.groupMetadata(jid);
-        const participants = (metadata.participants || []).map(p => p.id).filter(Boolean);
-        if (!participants.length) return;
-        const mentions = participants;
-        let body = "📢 TAG ALL\n\n" + mentions.map(p => `@${baseNumber(p)}`).join(" ");
-        if (command === "htag") body = "🔔 H-TAG\n\n" + mentions.map(p => `@${baseNumber(p)}`).join(" ");
+        const mentions = (metadata.participants || []).map(p => p.id).filter(Boolean);
+        if (!mentions.length) return;
+
+        let body = `╭━━〔 📢 TAG ALL 〕━━╮
+┃
+${mentions.map((p, i) => `${i % 2 ? "⚡" : "🌱"} @${baseNumber(p)}`).join("\n")}
+┃
+╰━━━━━━━━━━━━━━╯`;
+
+        if (command === "htag") {
+          body = `╭━━〔 🔔 H-TAG 〕━━╮
+┃
+${mentions.map((p, i) => `${i % 2 ? "🫂" : "🟡"} @${baseNumber(p)}`).join("\n")}
+┃
+╰━━━━━━━━━━━━━━╯`;
+        }
+
         if (command === "totag") {
           const ctx = getContextInfo(msg);
           if (!ctx?.quotedMessage) {
-            await sendBotReply(sock, jid, `❌ আগে কোনো message reply/quote করে ${getBotPrefix()}totag দিন।`);
+            await sendBotReply(sock, jid, `❌ একটি message reply করে ${getBotPrefix()}totag দিন।`);
             return;
           }
-          const quoted = { key: { remoteJid: jid, id: ctx.stanzaId, participant: ctx.participant }, message: ctx.quotedMessage };
+          const quoted = {
+            key: { remoteJid: jid, id: ctx.stanzaId, participant: ctx.participant },
+            message: ctx.quotedMessage
+          };
           const quotedText = getText(quoted);
-          body = (quotedText ? `💬 ${quotedText}\n\n` : "💬 Message\n\n") + mentions.map(p => `@${baseNumber(p)}`).join(" ");
-          await sendBotReply(sock, jid, body, { mentions });
-          return;
+          body = (quotedText ? `💬 ${quotedText}\n\n` : "💬 Message\n\n") +
+            mentions.map(p => `@${baseNumber(p)}`).join(" ");
         }
+
         await sendBotReply(sock, jid, body, { mentions });
       }
     } else if (command === "kickall") {
       if (!isGroup(jid)) {
-        await sendBotReply(sock, jid, "❌ এই command শুধু group-এ ব্যবহার করা যাবে।");
+        await sendGroupOnlyReply(sock, jid, "❌ এই command শুধু group-এ ব্যবহার করা যাবে।");
       } else if (!(await isBotAdmin(sock, jid))) {
         await sendBotReply(sock, jid, "❌ Kickall করতে bot-কে admin করতে হবে।");
       } else {
@@ -1518,7 +1958,7 @@ ${getBotPrefix()}antistatus kick on/off`);
       }
     } else if (command === "linkreset" || command === "resetlink") {
       if (!isGroup(jid)) {
-        await sendBotReply(sock, jid, "❌ এই command শুধু group-এ ব্যবহার করা যাবে।");
+        await sendGroupOnlyReply(sock, jid, "❌ এই command শুধু group-এ ব্যবহার করা যাবে।");
       } else if (!(await isBotAdmin(sock, jid))) {
         await sendBotReply(sock, jid, "❌ Link reset করতে bot-কে admin করতে হবে।");
       } else {
@@ -1534,7 +1974,7 @@ https://chat.whatsapp.com/${code}`);
       }
     } else if (command === "link" || command === "grouplink") {
       if (!isGroup(jid)) {
-        await sendBotReply(sock, jid, "❌ এই command শুধু group-এ ব্যবহার করা যাবে।");
+        await sendGroupOnlyReply(sock, jid, "❌ এই command শুধু group-এ ব্যবহার করা যাবে।");
       } else if (!(await isBotAdmin(sock, jid))) {
         await sendBotReply(sock, jid, "❌ Group link দিতে bot-কে admin করতে হবে।");
       } else {
@@ -1548,7 +1988,7 @@ https://chat.whatsapp.com/${code}`);
       }
     } else if (command === "group" || command === "open" || command === "close") {
       if (!isGroup(jid)) {
-        await sendBotReply(sock, jid, "❌ এই command শুধু group-এ ব্যবহার করা যাবে।");
+        await sendGroupOnlyReply(sock, jid, "❌ এই command শুধু group-এ ব্যবহার করা যাবে।");
       } else {
         let action = command;
         if (command === "group") action = args[0]?.toLowerCase();
@@ -1578,7 +2018,7 @@ https://chat.whatsapp.com/${code}`);
       }
     } else if (command === "setwelcome") {
       if (!isGroup(jid)) {
-        await sendBotReply(sock, jid, "❌ setwelcome শুধু group-এ ব্যবহার করা যাবে।");
+        await sendGroupOnlyReply(sock, jid, "❌ setwelcome শুধু group-এ ব্যবহার করা যাবে।");
       } else {
         const value = cleanCustomMessage(argsRaw);
         if (!value) {
@@ -1599,7 +2039,7 @@ https://chat.whatsapp.com/${code}`);
       }
     } else if (command === "setgoodbye") {
       if (!isGroup(jid)) {
-        await sendBotReply(sock, jid, "❌ setgoodbye শুধু group-এ ব্যবহার করা যাবে।");
+        await sendGroupOnlyReply(sock, jid, "❌ setgoodbye শুধু group-এ ব্যবহার করা যাবে।");
       } else {
         const value = cleanCustomMessage(argsRaw);
         if (!value) {
@@ -1622,10 +2062,15 @@ https://chat.whatsapp.com/${code}`);
       await sendBotReply(sock, jid, "🌙 Good night everyone! Sweet dreams 😴✨");
     } else if (command === "song" || command === "play") {
       if (!settings.song) return void await sendBotReply(sock, jid, "🎵 Song command is OFF.");
-      await sendOwnerCommandCard(sock, jid, command === "play" ? "▶️ PLAY" : "🎧 SONG", "⏳ Song খোঁজা হচ্ছে...");
+      await sendOwnerCommandCard(
+        sock,
+        jid,
+        command === "play" ? "▶️ PLAY" : "🎧 SONG",
+        `⏳ ${command === "play" ? "Play" : "Song"} খোঁজা হচ্ছে...\n🎵 ${args.join(" ") || "কোনো নাম দেওয়া হয়নি"}`
+      );
       await sendSong(sock, jid, args.join(" "));
     } else if (command === "gcstory") {
-      if (!isGroup(jid)) return void await sendBotReply(sock, jid, `❌ ${getBotPrefix()}gcstory শুধু group-এ ব্যবহার করা যাবে।`);
+      if (!isGroup(jid)) return void await sendGroupOnlyReply(sock, jid, `❌ ${getBotPrefix()}gcstory শুধু group-এ ব্যবহার করা যাবে।`);
       const ctx = getContextInfo(msg);
       if (!ctx.quotedMessage) return void await sendBotReply(sock, jid, `❌ আগে একটি photo/video/text/link message reply/quote করে ${getBotPrefix()}gcstory দিন।`);
 
@@ -1670,13 +2115,19 @@ https://chat.whatsapp.com/${code}`);
         groupStatusMessage = { text: qt };
       }
 
-      // IMPORTANT: publish as WhatsApp Group Status (groupStatusMessageV2),
-      // not as status@broadcast. The stock @whiskeysockets/baileys 6.7.24
-      // treats the wrapper as an unknown media object and throws
-      // "Invalid media type". The group-status-capable fork accepts the
-      // groupStatus wrapper and builds the proper V2 envelope.
-      await sock.sendMessage(jid, { ...groupStatusMessage, groupStatus: true });
-      await sendBotReply(sock, jid, "📖 GROUP STATUS ok ✅\n POWER BOSS X ।");
+      // Publish as WhatsApp Group Status using this Baileys fork's supported wrapper.
+      await sock.sendMessage(jid, {
+        ...groupStatusMessage,
+        groupStatus: true
+      });
+
+      // Same compact owner-thumbnail reply style as .ping/.play/.song.
+      await sendOwnerCommandCard(
+        sock,
+        jid,
+        "📖 GCSTORY",
+        "✅ Group Story published successfully"
+      );
     }
   } catch (e) {
     logger.error({ err:e, command, jid }, "command failed");
@@ -1771,7 +2222,7 @@ async function startBot() {
       try {
         await new Promise(r => setTimeout(r, 2000));
         const code = await sock.requestPairingCode(number);
-        console.log(`\n🔐 PAIRING CODE: ${BOSSXBOT}\n`);
+        console.log(`\n🔐 PAIRING CODE: ${code}\n`);
       } catch (e) {
         console.error("❌ Pairing code error:", e.message);
       }
@@ -1818,9 +2269,10 @@ async function startBot() {
       const rawParticipants = Array.isArray(participants)
         ? participants
         : (update?.participant ? [update.participant] : []);
-      const changedParticipants = Array.from(new Set(
-        rawParticipants.filter(Boolean).map(String)
-      ));
+      // Some Baileys forks send participant objects here instead of plain JIDs.
+      // Never stringify those objects, otherwise welcome/goodbye becomes
+      // "@object Object" and WhatsApp cannot create the mention.
+      const changedParticipants = normalizeParticipantList(rawParticipants);
 
       logger.info({
         id,
@@ -1829,6 +2281,27 @@ async function startBot() {
         welcomeEnabled: isWelcomeEnabledForGroup(id),
         goodbyeEnabled: isGoodbyeEnabledForGroup(id)
       }, "group participant update");
+
+      // AUTOADMIN: if enabled, automatically promote the configured owner
+      // when the owner joins/is detected. WhatsApp still requires the bot
+      // itself to already be a group admin.
+      if (settings.autoAdmin && action === "add" && changedParticipants.length) {
+        const ownerNumber = baseNumber(normalizeJid(config.OWNER_NUMBER));
+        const ownerTarget = changedParticipants.find(p => baseNumber(p) === ownerNumber);
+        if (ownerTarget && await isBotAdmin(sock, id)) {
+          try {
+            const ownerParticipant = await getGroupParticipant(sock, id, ownerTarget);
+            if (ownerParticipant && !participantIsAdmin(ownerParticipant)) {
+              const targetJid = await resolveParticipantJid(sock, id, ownerTarget);
+              await sock.groupParticipantsUpdate(id, [targetJid], "promote");
+              logger.info({ id, targetJid }, "AUTOADMIN promoted owner");
+            }
+          } catch (e) {
+            logger.warn({ err: e, id, ownerTarget }, "AUTOADMIN promotion failed");
+          }
+        }
+      }
+
 
       if (action === "add" && changedParticipants.length && isWelcomeEnabledForGroup(id)) {
         await new Promise(r => setTimeout(r, 800));
